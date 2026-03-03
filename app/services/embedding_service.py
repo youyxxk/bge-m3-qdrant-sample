@@ -3,8 +3,8 @@ Embedding service for generating BGE-M3 embeddings.
 Handles dense, sparse, and ColBERT vector generation.
 """
 
-from typing import Any
 from dataclasses import dataclass
+
 import numpy as np
 from FlagEmbedding import BGEM3FlagModel
 

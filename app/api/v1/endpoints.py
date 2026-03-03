@@ -4,7 +4,7 @@ Uses dependency injection for EmbeddingService and VectorStoreService.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from typing import Annotated
+from typing import Annotated, Any
 
 from app.core.config import settings
 from app.models.schemas import (
@@ -14,7 +14,7 @@ from app.models.schemas import (
     SearchResult,
     IngestResponse,
 )
-from app.services.embedding_service import EmbeddingService
+from app.services.embedding_service import EmbeddingService, EmbeddingOutput
 from app.services.vector_store import VectorStoreService
 
 
@@ -74,10 +74,10 @@ async def ingest_document(
         )
         
         # Generate embeddings
-        embeddings = embedding_svc.generate_embeddings(text)
+        embeddings: EmbeddingOutput = embedding_svc.generate_embeddings(text)
         
         # Prepare payload
-        payload = document.model_dump()
+        payload: dict[str, Any] = document.model_dump()
         
         # Upsert to vector store
         vector_svc.upsert(
@@ -95,6 +95,7 @@ async def ingest_document(
         )
         
     except Exception as e:
+        print(str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to ingest document: {str(e)}"
