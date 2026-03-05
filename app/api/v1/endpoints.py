@@ -5,7 +5,8 @@ Uses dependency injection for EmbeddingService and VectorStoreService.
 
 import csv
 import io
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from typing import Annotated, Any
 from qdrant_client import models
 
@@ -19,6 +20,7 @@ from app.models.schemas import (
 )
 from app.services.embedding_service import EmbeddingService, EmbeddingOutput
 from app.services.vector_store import VectorStoreService
+from app.utils.chunking import get_chunks
 
 
 router = APIRouter()
@@ -58,7 +60,11 @@ VectorStoreDep = Annotated[VectorStoreService, Depends(get_vector_store)]
 async def ingest_document(
     document: DocumentIngest,
     embedding_svc: EmbeddingServiceDep,
-    vector_svc: VectorStoreDep
+    vector_svc: VectorStoreDep,
+    chunking_strategy: str = Query("none", description="Chunking strategy: none, character, word, recursive, semantic"),
+    chunk_size: int = Query(500, description="Maximum size of chunks (chars/words)"),
+    chunk_overlap: int = Query(50, description="Overlap between chunks"),
+    threshold: float = Query(0.5, description="Similarity threshold for semantic chunking")
 ) -> IngestResponse:
     """
     Ingest a document into the vector store.
@@ -70,29 +76,69 @@ async def ingest_document(
         # Ensure collection exists
         vector_svc.create_collection_if_not_exists()
         
-        # Format text for embedding
-        text = embedding_svc.format_product_text(
-            name=document.name,
-            description=document.description
+        # Chunking logic
+        chunks = get_chunks(
+            document.description, 
+            strategy=chunking_strategy, 
+            chunk_size=chunk_size, 
+            chunk_overlap=chunk_overlap,
+            google_api_key=settings.google_api_key,
+            threshold=threshold,
+            model_name=settings.google_embedding_model
         )
         
-        # Generate embeddings
-        embeddings: EmbeddingOutput = embedding_svc.generate_embeddings(text)
+        points = []
+        for idx, chunk_text in enumerate(chunks):
+            # Format text for embedding
+            text = embedding_svc.format_product_text(
+                name=document.name,
+                description=chunk_text
+            )
+            
+            # Generate embeddings
+            embeddings: EmbeddingOutput = embedding_svc.generate_embeddings(text)
+            
+            # Prepare payload
+            payload: dict[str, Any] = document.model_dump()
+            payload["description"] = chunk_text
+            
+            if len(chunks) > 1 or chunking_strategy != "none":
+                try:
+                    namespace_uuid = uuid.UUID(document.id)
+                except ValueError:
+                    namespace_uuid = uuid.NAMESPACE_OID
+                
+                chunk_id = str(uuid.uuid5(namespace_uuid, f"{document.id}_chunk_{idx}"))
+                payload["id"] = chunk_id
+                payload["parent_id"] = document.id
+                payload["chunk_index"] = idx
+                payload["total_chunks"] = len(chunks)
+                payload["chunk_metadata"] = {
+                    "strategy": chunking_strategy,
+                    "size": chunk_size,
+                    "overlap": chunk_overlap
+                }
+            else:
+                chunk_id = document.id
+                
+            qdrant_sparse = vector_svc.create_sparse_vector(embeddings.sparse_weights)
+            points.append(
+                models.PointStruct(
+                    id=chunk_id,
+                    payload=payload,
+                    vector={
+                        "dense": embeddings.dense_vector.tolist(),
+                        "colbert": embeddings.colbert_vectors.tolist(),
+                        "sparse": qdrant_sparse
+                    }
+                )
+            )
+            
+        vector_svc.batch_upsert(points)
         
-        # Prepare payload
-        payload: dict[str, Any] = document.model_dump()
-        
-        # Upsert to vector store
-        vector_svc.upsert(
-            point_id=document.id,
-            payload=payload,
-            dense_vector=embeddings.dense_vector,
-            sparse_weights=embeddings.sparse_weights,
-            colbert_vectors=embeddings.colbert_vectors
-        )
         return IngestResponse(
             success=True,
-            message="Document ingested successfully",
+            message=f"Document ingested successfully into {len(chunks)} chunk(s)",
             document_id=document.id
         )
     except Exception as e:
@@ -112,13 +158,18 @@ async def ingest_document(
 async def ingest_csv(
     embedding_svc: EmbeddingServiceDep,
     vector_svc: VectorStoreDep,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    chunking_strategy: str = Query("none", description="Chunking strategy: none, character, word, recursive, semantic"),
+    chunk_size: int = Query(500, description="Maximum size of chunks (chars/words)"),
+    chunk_overlap: int = Query(50, description="Overlap between chunks"),
+    threshold: float = Query(0.5, description="Similarity threshold for semantic chunking")
 ) -> dict:
     """
     Ingest multiple documents from a pipe-separated CSV file.
     
     - Parses CSV (pipe-separated)
     - Validates each row with DocumentIngest schema
+    - Applies text chunking on descriptions
     - Generates embeddings in batches
     - Upserts to Qdrant in batches
     """
@@ -130,39 +181,81 @@ async def ingest_csv(
         # Ensure collection exists
         vector_svc.create_collection_if_not_exists()
         
-        documents = []
+        documents_to_embed = []
+        original_doc_count = 0
+        
         for row in reader:
             try:
                 # Map CSV fields to DocumentIngest (handle case sensitivity if needed)
-                # The user's example shows: Id|Name|Description|Price|PriceCurrency|SupplyAbility|MinimumOrder
                 doc_data = {
                     "id": row.get("Id"),
                     "name": row.get("Name"),
-                    "description": row.get("Description"),
+                    "description": row.get("Description", ""),
                     "price": float(row.get("Price", 0)),
                     "price_currency": row.get("PriceCurrency"),
                     "supply_ability": int(row.get("SupplyAbility")) if row.get("SupplyAbility") else None,
                     "minimum_order": int(row.get("MinimumOrder")) if row.get("MinimumOrder") else None
                 }
-                documents.append(DocumentIngest(**doc_data))
+                validated_doc = DocumentIngest(**doc_data)
+                original_doc_count += 1
+                
+                chunks = get_chunks(
+                    validated_doc.description, 
+                    strategy=chunking_strategy, 
+                    chunk_size=chunk_size, 
+                    chunk_overlap=chunk_overlap,
+                    google_api_key=settings.google_api_key,
+                    threshold=threshold,
+                    model_name=settings.google_embedding_model
+                )
+                
+                for idx, chunk_text in enumerate(chunks):
+                    chunk_payload_data = validated_doc.model_dump()
+                    chunk_payload_data["description"] = chunk_text
+                    
+                    if len(chunks) > 1 or chunking_strategy != "none":
+                        try:
+                            namespace_uuid = uuid.UUID(validated_doc.id)
+                        except ValueError:
+                            namespace_uuid = uuid.NAMESPACE_OID
+                            
+                        chunk_id = str(uuid.uuid5(namespace_uuid, f"{validated_doc.id}_chunk_{idx}"))
+                        chunk_payload_data["id"] = chunk_id
+                        chunk_payload_data["parent_id"] = validated_doc.id
+                        chunk_payload_data["chunk_index"] = idx
+                        chunk_payload_data["total_chunks"] = len(chunks)
+                        chunk_payload_data["chunk_metadata"] = {
+                            "strategy": chunking_strategy,
+                            "size": chunk_size,
+                            "overlap": chunk_overlap
+                        }
+                    else:
+                        chunk_id = validated_doc.id
+                        
+                    documents_to_embed.append({
+                        "id": chunk_id,
+                        "name": validated_doc.name,
+                        "description": chunk_text,
+                        "payload": chunk_payload_data
+                    })
             except (ValueError, TypeError) as e:
                 print(f"Skipping invalid row: {row}. Error: {e}")
                 continue
 
-        if not documents:
+        if not documents_to_embed:
             return {"message": "No valid documents found in CSV", "count": 0}
 
         # Process in batches
         batch_size = 50
-        total_ingested = 0
+        total_chunks_ingested = len(documents_to_embed)
         
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i:i + batch_size]
+        for i in range(0, len(documents_to_embed), batch_size):
+            batch = documents_to_embed[i:i + batch_size]
             
             # Prepare texts for embedding
             batch_texts = [
-                embedding_svc.format_product_text(doc.name, doc.description)
-                for doc in batch
+                embedding_svc.format_product_text(item["name"], item["description"])
+                for item in batch
             ]
             
             # Generate embeddings in batch
@@ -170,12 +263,12 @@ async def ingest_csv(
             
             # Prepare PointStructs
             points = []
-            for doc, embs in zip(batch, batch_embeddings):
+            for item, embs in zip(batch, batch_embeddings):
                 qdrant_sparse = vector_svc.create_sparse_vector(embs.sparse_weights)
                 points.append(
                     models.PointStruct(
-                        id=doc.id,
-                        payload=doc.model_dump(),
+                        id=item["id"],
+                        payload=item["payload"],
                         vector={
                             "dense": embs.dense_vector.tolist(),
                             "colbert": embs.colbert_vectors.tolist(),
@@ -186,12 +279,13 @@ async def ingest_csv(
             
             # Batch upsert
             vector_svc.batch_upsert(points)
-            total_ingested += len(batch)
 
         return {
             "success": True,
-            "message": f"Successfully ingested {total_ingested} documents",
-            "count": total_ingested
+            "message": f"Successfully ingested {original_doc_count} source documents into {total_chunks_ingested} chunks",
+            "source_documents": original_doc_count,
+            "total_chunks": total_chunks_ingested,
+            "count": total_chunks_ingested
         }
 
     except Exception as e:
@@ -276,3 +370,21 @@ async def init_collection(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to initialize collection: {str(e)}"
         )
+
+@router.get(
+    "/list-google-models",
+    summary="List Google AI embedding models",
+    description="Fetch available embedding models from Google Generative AI"
+)
+async def list_models() -> dict:
+    """List available Google AI models that support embedding."""
+    from app.utils.chunking import list_google_models
+    
+    if not settings.google_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GOOGLE_API_KEY is not configured"
+        )
+    
+    models = list_google_models(settings.google_api_key)
+    return {"models": models}
