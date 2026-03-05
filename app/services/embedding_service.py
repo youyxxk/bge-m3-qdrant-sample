@@ -54,6 +54,37 @@ class EmbeddingService:
             colbert_vectors=output['colbert_vecs'][0]
         )
     
+    def generate_batch_embeddings(self, texts: list[str]) -> list[EmbeddingOutput]:
+        """
+        Generate embeddings for a list of texts in batch.
+        
+        Args:
+            texts: List of input texts to embed
+            
+        Returns:
+            List of EmbeddingOutput objects
+        """
+        if not texts:
+            return []
+            
+        outputs = self._model.encode(
+            texts,
+            return_dense=True,
+            return_sparse=True,
+            return_colbert_vecs=True
+        )
+        
+        result = []
+        for i in range(len(texts)):
+            result.append(
+                EmbeddingOutput(
+                    dense_vector=outputs['dense_vecs'][i],
+                    sparse_weights=outputs['lexical_weights'][i],
+                    colbert_vectors=outputs['colbert_vecs'][i]
+                )
+            )
+        return result
+    
     @staticmethod
     def format_product_text(name: str, description: str) -> str:
         """

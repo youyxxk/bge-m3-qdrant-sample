@@ -3,8 +3,11 @@ API endpoints for RAG service.
 Uses dependency injection for EmbeddingService and VectorStoreService.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import csv
+import io
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from typing import Annotated, Any
+from qdrant_client import models
 
 from app.core.config import settings
 from app.models.schemas import (
@@ -87,18 +90,115 @@ async def ingest_document(
             sparse_weights=embeddings.sparse_weights,
             colbert_vectors=embeddings.colbert_vectors
         )
-        
         return IngestResponse(
             success=True,
             message="Document ingested successfully",
             document_id=document.id
         )
-        
     except Exception as e:
         print(str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to ingest document: {str(e)}"
+        )
+
+
+@router.post(
+    "/ingest/csv",
+    status_code=status.HTTP_201_CREATED,
+    summary="Ingest documents from CSV",
+    description="Upload a pipe-separated CSV file to ingest multiple documents"
+)
+async def ingest_csv(
+    embedding_svc: EmbeddingServiceDep,
+    vector_svc: VectorStoreDep,
+    file: UploadFile = File(...)
+) -> dict:
+    """
+    Ingest multiple documents from a pipe-separated CSV file.
+    
+    - Parses CSV (pipe-separated)
+    - Validates each row with DocumentIngest schema
+    - Generates embeddings in batches
+    - Upserts to Qdrant in batches
+    """
+    try:
+        content = await file.read()
+        stream = io.StringIO(content.decode("utf-8"))
+        reader = csv.DictReader(stream, delimiter="|")
+        
+        # Ensure collection exists
+        vector_svc.create_collection_if_not_exists()
+        
+        documents = []
+        for row in reader:
+            try:
+                # Map CSV fields to DocumentIngest (handle case sensitivity if needed)
+                # The user's example shows: Id|Name|Description|Price|PriceCurrency|SupplyAbility|MinimumOrder
+                doc_data = {
+                    "id": row.get("Id"),
+                    "name": row.get("Name"),
+                    "description": row.get("Description"),
+                    "price": float(row.get("Price", 0)),
+                    "price_currency": row.get("PriceCurrency"),
+                    "supply_ability": int(row.get("SupplyAbility")) if row.get("SupplyAbility") else None,
+                    "minimum_order": int(row.get("MinimumOrder")) if row.get("MinimumOrder") else None
+                }
+                documents.append(DocumentIngest(**doc_data))
+            except (ValueError, TypeError) as e:
+                print(f"Skipping invalid row: {row}. Error: {e}")
+                continue
+
+        if not documents:
+            return {"message": "No valid documents found in CSV", "count": 0}
+
+        # Process in batches
+        batch_size = 50
+        total_ingested = 0
+        
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i + batch_size]
+            
+            # Prepare texts for embedding
+            batch_texts = [
+                embedding_svc.format_product_text(doc.name, doc.description)
+                for doc in batch
+            ]
+            
+            # Generate embeddings in batch
+            batch_embeddings = embedding_svc.generate_batch_embeddings(batch_texts)
+            
+            # Prepare PointStructs
+            points = []
+            for doc, embs in zip(batch, batch_embeddings):
+                qdrant_sparse = vector_svc.create_sparse_vector(embs.sparse_weights)
+                points.append(
+                    models.PointStruct(
+                        id=doc.id,
+                        payload=doc.model_dump(),
+                        vector={
+                            "dense": embs.dense_vector.tolist(),
+                            "colbert": embs.colbert_vectors.tolist(),
+                            "sparse": qdrant_sparse
+                        }
+                    )
+                )
+            
+            # Batch upsert
+            vector_svc.batch_upsert(points)
+            total_ingested += len(batch)
+
+        return {
+            "success": True,
+            "message": f"Successfully ingested {total_ingested} documents",
+            "count": total_ingested
+        }
+
+    except Exception as e:
+        print(f"CSV Ingestion Error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to ingest CSV: {str(e)}"
         )
 
 

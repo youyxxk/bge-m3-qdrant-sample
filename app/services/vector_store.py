@@ -116,34 +116,40 @@ class VectorStoreService:
     ) -> None:
         """
         Insert or update a document with all three vector types.
-        
-        Args:
-            point_id: Unique identifier for the point
-            payload: Document metadata/payload
-            dense_vector: Dense embedding vector
-            sparse_weights: Sparse vector weights from BGE-M3
-            colbert_vectors: ColBERT multi-vectors
         """
         # Convert sparse weights to Qdrant format
         qdrant_sparse = self.create_sparse_vector(sparse_weights)
         
+        point = models.PointStruct(
+            id=point_id,
+            payload=payload,
+            vector={
+                "dense": dense_vector.tolist() if isinstance(dense_vector, np.ndarray) else dense_vector,
+                "colbert": colbert_vectors.tolist() if isinstance(colbert_vectors, np.ndarray) else colbert_vectors,
+                "sparse": qdrant_sparse
+            }
+        )
+        
+        self.batch_upsert([point])
+
+    def batch_upsert(self, points: list[models.PointStruct]) -> None:
+        """
+        Batch insert or update documents.
+        
+        Args:
+            points: List of Qdrant PointStruct objects
+        """
+        if not points:
+            return
+            
         try:
             self._client.upsert(
                 collection_name=self._collection_name,
-                points=[
-                    models.PointStruct(
-                        id=point_id,
-                        payload=payload,
-                        vector={
-                            "dense": dense_vector.tolist() if isinstance(dense_vector, np.ndarray) else dense_vector,
-                            "colbert": colbert_vectors.tolist() if isinstance(colbert_vectors, np.ndarray) else colbert_vectors,
-                            "sparse": qdrant_sparse
-                        }
-                    )
-                ]
+                wait=True,
+                points=points
             )
         except Exception as e:
-            raise RuntimeError(f"Failed to upsert document: {str(e)}")
+            raise RuntimeError(f"Failed to batch upsert documents: {str(e)}")
     
     def search(
         self,
