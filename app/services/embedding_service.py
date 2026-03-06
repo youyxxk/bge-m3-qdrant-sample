@@ -5,8 +5,10 @@ Handles dense, sparse, and ColBERT vector generation.
 
 from dataclasses import dataclass
 
+from typing import Optional
 import numpy as np
 from FlagEmbedding import BGEM3FlagModel
+from app.core.config import settings
 
 
 @dataclass
@@ -14,7 +16,7 @@ class EmbeddingOutput:
     """Container for embedding outputs."""
     dense_vector: np.ndarray
     sparse_weights: dict[str, float]
-    colbert_vectors: np.ndarray
+    colbert_vectors: Optional[np.ndarray] = None
 
 
 class EmbeddingService:
@@ -33,25 +35,26 @@ class EmbeddingService:
     
     def generate_embeddings(self, text: str) -> EmbeddingOutput:
         """
-        Generate all three types of embeddings for a given text.
+        Generate embeddings for a given text.
         
         Args:
             text: Input text to embed
             
         Returns:
-            EmbeddingOutput containing dense, sparse, and ColBERT vectors
+            EmbeddingOutput containing dense, sparse, and optionally ColBERT vectors
         """
+        use_colbert = settings.use_colbert
         output = self._model.encode(
             [text],
             return_dense=True,
             return_sparse=True,
-            return_colbert_vecs=True
+            return_colbert_vecs=use_colbert
         )
         
         return EmbeddingOutput(
             dense_vector=output['dense_vecs'][0],
             sparse_weights=output['lexical_weights'][0],
-            colbert_vectors=output['colbert_vecs'][0]
+            colbert_vectors=output['colbert_vecs'][0] if use_colbert else None
         )
     
     def generate_batch_embeddings(self, texts: list[str]) -> list[EmbeddingOutput]:
@@ -67,11 +70,12 @@ class EmbeddingService:
         if not texts:
             return []
             
+        use_colbert = settings.use_colbert
         outputs = self._model.encode(
             texts,
             return_dense=True,
             return_sparse=True,
-            return_colbert_vecs=True
+            return_colbert_vecs=use_colbert
         )
         
         result = []
@@ -80,7 +84,7 @@ class EmbeddingService:
                 EmbeddingOutput(
                     dense_vector=outputs['dense_vecs'][i],
                     sparse_weights=outputs['lexical_weights'][i],
-                    colbert_vectors=outputs['colbert_vecs'][i]
+                    colbert_vectors=outputs['colbert_vecs'][i] if use_colbert else None
                 )
             )
         return result

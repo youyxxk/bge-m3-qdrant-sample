@@ -122,15 +122,18 @@ async def ingest_document(
                 chunk_id = document.id
                 
             qdrant_sparse = vector_svc.create_sparse_vector(embeddings.sparse_weights)
+            vector_data = {
+                "dense": embeddings.dense_vector.tolist(),
+                "sparse": qdrant_sparse
+            }
+            if embeddings.colbert_vectors is not None:
+                vector_data["colbert"] = embeddings.colbert_vectors.tolist()
+
             points.append(
                 models.PointStruct(
                     id=chunk_id,
                     payload=payload,
-                    vector={
-                        "dense": embeddings.dense_vector.tolist(),
-                        "colbert": embeddings.colbert_vectors.tolist(),
-                        "sparse": qdrant_sparse
-                    }
+                    vector=vector_data
                 )
             )
             
@@ -265,15 +268,18 @@ async def ingest_csv(
             points = []
             for item, embs in zip(batch, batch_embeddings):
                 qdrant_sparse = vector_svc.create_sparse_vector(embs.sparse_weights)
+                vector_data = {
+                    "dense": embs.dense_vector.tolist(),
+                    "sparse": qdrant_sparse
+                }
+                if embs.colbert_vectors is not None:
+                    vector_data["colbert"] = embs.colbert_vectors.tolist()
+
                 points.append(
                     models.PointStruct(
                         id=item["id"],
                         payload=item["payload"],
-                        vector={
-                            "dense": embs.dense_vector.tolist(),
-                            "colbert": embs.colbert_vectors.tolist(),
-                            "sparse": qdrant_sparse
-                        }
+                        vector=vector_data
                     )
                 )
             

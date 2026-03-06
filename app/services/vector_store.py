@@ -112,7 +112,7 @@ class VectorStoreService:
         payload: dict[str, Any],
         dense_vector: np.ndarray,
         sparse_weights: dict,
-        colbert_vectors: np.ndarray
+        colbert_vectors: Optional[np.ndarray] = None
     ) -> None:
         """
         Insert or update a document with all three vector types.
@@ -125,10 +125,12 @@ class VectorStoreService:
             payload=payload,
             vector={
                 "dense": dense_vector.tolist() if isinstance(dense_vector, np.ndarray) else dense_vector,
-                "colbert": colbert_vectors.tolist() if isinstance(colbert_vectors, np.ndarray) else colbert_vectors,
                 "sparse": qdrant_sparse
             }
         )
+        
+        if colbert_vectors is not None:
+            point.vector["colbert"] = colbert_vectors.tolist() if isinstance(colbert_vectors, np.ndarray) else colbert_vectors
         
         self.batch_upsert([point])
 
@@ -155,7 +157,7 @@ class VectorStoreService:
         self,
         dense_vector: np.ndarray,
         sparse_weights: dict,
-        colbert_vectors: np.ndarray,
+        colbert_vectors: Optional[np.ndarray] = None,
         limit: int = 3,
         prefetch_limit: int = 6
     ) -> list[dict[str, Any]]:
@@ -193,15 +195,26 @@ class VectorStoreService:
         ]
         
         try:
-            # Perform hybrid search with ColBERT reranking
-            results = self._client.query_points(
-                self._collection_name,
-                prefetch=prefetch,
-                query=colbert_vectors.tolist() if isinstance(colbert_vectors, np.ndarray) else colbert_vectors,
-                using="colbert",
-                with_payload=True,
-                limit=limit,
-            )
+            # Perform search (hybrid or purely dense+sparse depending on ColBERT availability)
+            if colbert_vectors is not None:
+                # Hybrid search with ColBERT reranking
+                results = self._client.query_points(
+                    self._collection_name,
+                    prefetch=prefetch,
+                    query=colbert_vectors.tolist() if isinstance(colbert_vectors, np.ndarray) else colbert_vectors,
+                    using="colbert",
+                    with_payload=True,
+                    limit=limit,
+                )
+            else:
+                # Hybrid search without ColBERT (Dense + Sparse)
+                results = self._client.query_points(
+                    self._collection_name,
+                    prefetch=prefetch,
+                    query=models.FusionQuery(fusion=models.Fusion.RRF),
+                    with_payload=True,
+                    limit=limit,
+                )
             
             # Convert to list of dicts
             return [

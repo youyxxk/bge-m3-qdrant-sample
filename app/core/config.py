@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     use_fp16: bool = True
     google_api_key: str | None = None
     google_embedding_model: str = "models/gemini-embedding-001"
+    use_colbert: bool = False
 
     # Vector Configuration
     dense_vector_size: int = 1024
